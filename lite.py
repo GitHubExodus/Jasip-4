@@ -12,8 +12,8 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 
-R2_ACCESS_KEY_ID = "00e18b0c16ecb3395cd6f7c8e0eb3554"
-R2_SECRET_ACCESS_KEY = "33799355abaedc234309dbfbc80a2a66c3bfd856f0dcaecf0031e1fbcbcd84a0"
+R2_ACCESS_KEY_ID = "f47f48ce0d129b1a69bb36da1d64bad1"
+R2_SECRET_ACCESS_KEY = "3e92e25062abc6fe86c13455712967444aa1ffa3492d1d81258f7f4ecd5923aa"
 R2_BUCKET_NAME = "stocks-data"
 
 R2_ENDPOINT = "https://98f8e959e677f16bddcf44f609fec6a0.r2.cloudflarestorage.com"
