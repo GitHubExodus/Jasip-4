@@ -12,14 +12,11 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 
-R2_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
-R2_ACCESS_KEY_ID = os.environ["R2_ACCESS_KEY_ID"]
-R2_SECRET_ACCESS_KEY = os.environ["R2_SECRET_ACCESS_KEY"]
+R2_ACCESS_KEY_ID = "00e18b0c16ecb3395cd6f7c8e0eb3554"
+R2_SECRET_ACCESS_KEY = "33799355abaedc234309dbfbc80a2a66c3bfd856f0dcaecf0031e1fbcbcd84a0"
 R2_BUCKET_NAME = "stocks-data"
 
-R2_ENDPOINT = (
-    f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-)
+R2_ENDPOINT = "https://98f8e959e677f16bddcf44f609fec6a0.r2.cloudflarestorage.com"
 
 TIMEZONE = "America/New_York"
 
