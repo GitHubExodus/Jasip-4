@@ -49,71 +49,51 @@ s3 = boto3.client(
 
 
 # ============================================================
-# 3. FILE DISCOVERY
+# 3. STOCK DISCOVERY + BATCHING
 # ============================================================
 
 BATCH_SIZE = 3
 
 LEVEL = int(os.environ["LEVEL"])
 
-stock_keys = []
+response = s3.get_object(
+    Bucket=R2_BUCKET_NAME,
+    Key="misc/symbols_full.txt",
+)
 
-continuation_token = None
+text = response["Body"].read().decode("utf-8")
 
-while True:
-
-    params = {
-        "Bucket": R2_BUCKET_NAME,
-    }
-
-    if continuation_token is not None:
-        params["ContinuationToken"] = continuation_token
-
-    response = s3.list_objects_v2(**params)
-
-    for obj in response.get("Contents", []):
-
-        key = obj["Key"]
-
-        if "/" not in key and key.lower().endswith(".parquet"):
-            stock_keys.append(key)
-
-    if not response.get("IsTruncated"):
-        break
-
-    continuation_token = response["NextContinuationToken"]
-
-
-# ============================================================
-# SELECT STOCK BATCH
-# ============================================================
-
-stock_keys.sort()
+stock_keys = [
+    line.strip().upper()
+    for line in text.splitlines()
+    if line.strip()
+]
 
 start_index = (LEVEL - 1) * BATCH_SIZE
 end_index = start_index + BATCH_SIZE
 
-stock_keys = stock_keys[start_index:end_index]
+stock_symbols = stock_keys[start_index:end_index]
 
 print(
     f"LEVEL {LEVEL}: "
     f"processing stocks {start_index + 1:,} "
-    f"to {min(end_index, start_index + len(stock_keys)):,}"
+    f"to {start_index + len(stock_symbols):,}"
 )
 
-print(f"Found {len(stock_keys):,} stock files to process")
-
+print(
+    f"Found {len(stock_symbols):,} stock files to process"
+)
 
 
 # ============================================================
 # 4. PROCESS EACH STOCK
 # ============================================================
 
-for key in stock_keys:
+for symbol in stock_symbols:
 
     obj = s3.get_object(
         Bucket=R2_BUCKET_NAME,
-        Key=key,
+        Key=f"{symbol}.parquet",
     )
 
     df = pd.read_parquet(
@@ -121,7 +101,6 @@ for key in stock_keys:
         columns=RAW_COLUMNS,
     )
 
-    symbol = key.rsplit("/", 1)[-1].removesuffix(".parquet").upper()
 
     print(f"Processing {symbol}...")
 
