@@ -404,7 +404,7 @@ for key in stock_keys:
     symbol = (
         key
         .rsplit("/", 1)[-1]
-        .removesuffix(".parquet")
+        .replace(".parquet", "")
         .upper()
     )
 
