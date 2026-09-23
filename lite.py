@@ -9,21 +9,36 @@ import gc
 import boto3
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
+import numba
 
 
-R2_ACCESS_KEY_ID = "f47f48ce0d129b1a69bb36da1d64bad1"
-R2_SECRET_ACCESS_KEY = "3e92e25062abc6fe86c13455712967444aa1ffa3492d1d81258f7f4ecd5923aa"
+R2_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
+R2_ACCESS_KEY_ID = os.environ["R2_ACCESS_KEY_ID"]
+R2_SECRET_ACCESS_KEY = os.environ["R2_SECRET_ACCESS_KEY"]
+
 R2_BUCKET_NAME = "stocks-data"
 
-R2_ENDPOINT = "https://98f8e959e677f16bddcf44f609fec6a0.r2.cloudflarestorage.com"
+R2_ENDPOINT = (
+    f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+)
 
 TIMEZONE = "America/New_York"
 
-DATA_START = pd.Timestamp("2025-01-01", tz=TIMEZONE)
-DATA_END = pd.Timestamp.now(tz=TIMEZONE)
+DATA_START = pd.Timestamp(
+    "2025-01-01",
+    tz=TIMEZONE,
+)
+
+DATA_END = pd.Timestamp.now(
+    tz=TIMEZONE,
+)
 
 WARMUP_DAYS = 20
+
+MAX_STOCKS = 3
+# Set to None to process all available stocks.
+
+HISTORY_PREFIX = "history"
 
 RAW_COLUMNS = [
     "timestamp",
@@ -32,6 +47,18 @@ RAW_COLUMNS = [
     "low",
     "close",
     "volume",
+]
+
+TP_TSL_CONFIGS = [
+    (0.05, 0.10),  # TP 5%,  TSL 10%
+    (0.05, 0.05),  # TP 5%,  TSL 5%
+    (0.10, 0.05),  # TP 10%, TSL 5%
+    (0.10, 0.10),  # TP 10%, TSL 10%
+    (0.20, 0.10),  # TP 20%, TSL 10%
+    (0.20, 0.15),  # TP 20%, TSL 15%
+    (0.30, 0.05),  # TP 30%, TSL 5%
+    (0.30, 0.10),  # TP 30%, TSL 10%
+    (0.30, 0.20),  # TP 30%, TSL 20%
 ]
 
 
@@ -44,274 +71,465 @@ s3 = boto3.client(
     endpoint_url=R2_ENDPOINT,
     aws_access_key_id=R2_ACCESS_KEY_ID,
     aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    region_name="auto",
 )
 
 
 # ============================================================
-# 3. STOCK DISCOVERY + BATCHING
+# 3. NUMBA TRADE SIMULATION
 # ============================================================
 
-BATCH_SIZE = 3
+@numba.njit(cache=True)
+def simulate_trades(
+    high,
+    low,
+    close,
+    entry_signal,
+    session_id,
+    session_final,
+    session_open,
+    tp_pct,
+    tsl_pct,
+):
+    """
+    Simulate every entry independently.
 
-LEVEL = int(os.environ["LEVEL"])
+    There is no:
+        - buying power
+        - balance
+        - allocation
+        - portfolio
+        - equity curve
+        - interaction between trades
 
-response = s3.get_object(
-    Bucket=R2_BUCKET_NAME,
-    Key="misc/symbols_full.txt",
-)
+    Each qualifying entry is its own independent trade.
 
-text = response["Body"].read().decode("utf-8")
+    Exit reason codes:
 
-stock_keys = [
-    line.strip().upper()
-    for line in text.splitlines()
-    if line.strip()
-]
+        1 = TAKE_PROFIT
+        2 = TRAILING_STOP
+        3 = SESSION_END_LIQUIDATION
+        0 = no trade
+    """
 
-start_index = (LEVEL - 1) * BATCH_SIZE
-end_index = start_index + BATCH_SIZE
+    n = len(high)
 
-stock_symbols = stock_keys[start_index:end_index]
+    trade_created = np.zeros(n, dtype=np.bool_)
+
+    entry_price_out = np.full(
+        n,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    take_profit_price_out = np.full(
+        n,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    trailing_stop_price_out = np.full(
+        n,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    highest_price_out = np.full(
+        n,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    exit_price_out = np.full(
+        n,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    trade_profit_pct_out = np.full(
+        n,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    trade_hold_minutes_out = np.full(
+        n,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    exit_reason_out = np.zeros(
+        n,
+        dtype=np.int8,
+    )
+
+    exit_index_out = np.full(
+        n,
+        -1,
+        dtype=np.int64,
+    )
+
+    n_trades = 0
+
+    for i in range(n):
+
+        if not entry_signal[i]:
+            continue
+
+        # --------------------------------------------------------
+        # Entry
+        # --------------------------------------------------------
+
+        entry_price = high[i] * 1.0025
+
+        take_profit_price = (
+            entry_price * (1.0 + tp_pct)
+        )
+
+        highest_price = entry_price
+
+        exit_price = np.nan
+        exit_index = -1
+        exit_reason = 0
+
+        # --------------------------------------------------------
+        # The entry candle itself is NOT used to manage the trade.
+        #
+        # Management starts with the next bar.
+        # --------------------------------------------------------
+
+        j = i + 1
+
+        while j < n:
+
+            # A trade cannot cross into another session.
+            if session_id[j] != session_id[i]:
+                break
+
+            # ----------------------------------------------------
+            # SESSION END LIQUIDATION
+            #
+            # If this is the actual final bar available for this
+            # stock/session, liquidate at THIS BAR'S CLOSE.
+            #
+            # This takes precedence over TP/TSL because the trade
+            # has reached the end of its trading session.
+            # ----------------------------------------------------
+
+            if session_final[j]:
+
+                exit_price = close[j]
+                exit_index = j
+                exit_reason = 3
+
+                break
+
+            bar_high = high[j]
+            bar_low = low[j]
+
+            # ----------------------------------------------------
+            # Update highest price reached after entry.
+            # ----------------------------------------------------
+
+            if bar_high > highest_price:
+                highest_price = bar_high
+
+            trailing_stop_price = (
+                highest_price * (1.0 - tsl_pct)
+            )
+
+            # ----------------------------------------------------
+            # Take profit
+            # ----------------------------------------------------
+
+            if bar_high >= take_profit_price:
+
+                exit_price = take_profit_price
+                exit_index = j
+                exit_reason = 1
+
+                break
+
+            # ----------------------------------------------------
+            # Trailing stop
+            #
+            # HIGH updates the trailing stop.
+            # LOW triggers the trailing stop.
+            # ----------------------------------------------------
+
+            if bar_low <= trailing_stop_price:
+
+                exit_price = trailing_stop_price
+                exit_index = j
+                exit_reason = 2
+
+                break
+
+            j += 1
+
+        # --------------------------------------------------------
+        # Entry on the actual final bar.
+        #
+        # There is no subsequent bar, so the trade is liquidated
+        # using that final bar's close.
+        # --------------------------------------------------------
+
+        if exit_reason == 0 and session_final[i]:
+
+            exit_price = close[i]
+            exit_index = i
+            exit_reason = 3
+
+        # --------------------------------------------------------
+        # Record trade
+        # --------------------------------------------------------
+
+        if exit_reason != 0:
+
+            trade_created[i] = True
+
+            entry_price_out[i] = entry_price
+
+            take_profit_price_out[i] = (
+                take_profit_price
+            )
+
+            highest_price_out[i] = highest_price
+
+            if exit_reason == 1:
+
+                trailing_stop_price_out[i] = (
+                    highest_price
+                    * (1.0 - tsl_pct)
+                )
+
+            elif exit_reason == 2:
+
+                trailing_stop_price_out[i] = (
+                    exit_price
+                )
+
+            else:
+
+                trailing_stop_price_out[i] = (
+                    highest_price
+                    * (1.0 - tsl_pct)
+                )
+
+            exit_price_out[i] = exit_price
+
+            trade_profit_pct_out[i] = (
+                (exit_price - entry_price)
+                / entry_price
+                * 100.0
+            )
+
+            trade_hold_minutes_out[i] = (
+                (exit_index - i)
+                # Timestamp differences are calculated outside
+                # Numba because timestamps are timezone-aware.
+            )
+
+            exit_reason_out[i] = exit_reason
+            exit_index_out[i] = exit_index
+
+            n_trades += 1
+
+    return (
+        trade_created,
+        entry_price_out,
+        take_profit_price_out,
+        trailing_stop_price_out,
+        highest_price_out,
+        exit_price_out,
+        trade_profit_pct_out,
+        trade_hold_minutes_out,
+        exit_reason_out,
+        exit_index_out,
+        n_trades,
+    )
+
+
+# ============================================================
+# 4. FILE DISCOVERY
+# ============================================================
+
+stock_keys = []
+
+continuation_token = None
+
+while True:
+
+    params = {
+        "Bucket": R2_BUCKET_NAME,
+    }
+
+    if continuation_token is not None:
+        params["ContinuationToken"] = continuation_token
+
+    response = s3.list_objects_v2(**params)
+
+    for obj in response.get("Contents", []):
+
+        key = obj["Key"]
+
+        if (
+            "/" not in key
+            and key.lower().endswith(".parquet")
+        ):
+            stock_keys.append(key)
+
+    if not response.get("IsTruncated"):
+        break
+
+    continuation_token = (
+        response["NextContinuationToken"]
+    )
+
+if MAX_STOCKS is not None:
+
+    stock_keys = stock_keys[:MAX_STOCKS]
 
 print(
-    f"LEVEL {LEVEL}: "
-    f"processing stocks {start_index + 1:,} "
-    f"to {start_index + len(stock_symbols):,}"
-)
-
-print(
-    f"Found {len(stock_symbols):,} stock files to process"
+    f"Found {len(stock_keys):,} stock files to process"
 )
 
 
 # ============================================================
-# 4. PROCESS EACH STOCK
+# 5. PROCESS EACH STOCK
 # ============================================================
 
-for symbol in stock_symbols:
+for key in stock_keys:
+
+    symbol = (
+        key
+        .rsplit("/", 1)[-1]
+        .removesuffix(".parquet")
+        .upper()
+    )
+
+    print()
+    print("=" * 60)
+    print(f"Processing {symbol}")
+    print("=" * 60)
+
+    # --------------------------------------------------------
+    # Load stock data directly from R2
+    # --------------------------------------------------------
 
     obj = s3.get_object(
         Bucket=R2_BUCKET_NAME,
-        Key=f"{symbol}.parquet",
+        Key=key,
     )
 
+    raw_bytes = obj["Body"].read()
+
     df = pd.read_parquet(
-        io.BytesIO(obj["Body"].read()),
+        io.BytesIO(raw_bytes),
         columns=RAW_COLUMNS,
     )
 
+    del raw_bytes
+    gc.collect()
 
-    print(f"Processing {symbol}...")
+    # ========================================================
+    # 6. CLEAN DATA + NEW YORK TIME
+    # ========================================================
 
-    # ============================================================
-    # 5. CLEAN DATA + TIMEZONE
-    # ============================================================
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"],
+        utc=True,
+    )
 
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df["open"] = df["open"].astype(
+        np.float64
+    )
 
-    df["open"] = df["open"].astype(np.float64)
-    df["high"] = df["high"].astype(np.float64)
-    df["low"] = df["low"].astype(np.float64)
-    df["close"] = df["close"].astype(np.float64)
-    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+    df["high"] = df["high"].astype(
+        np.float64
+    )
+
+    df["low"] = df["low"].astype(
+        np.float64
+    )
+
+    df["close"] = df["close"].astype(
+        np.float64
+    )
+
+    df["volume"] = pd.to_numeric(
+        df["volume"],
+        errors="coerce",
+    )
 
     df = (
-        df.dropna(subset=RAW_COLUMNS)
+        df
+        .dropna(subset=RAW_COLUMNS)
         .drop_duplicates("timestamp")
         .sort_values("timestamp")
         .reset_index(drop=True)
     )
 
-    df["timestamp"] = df["timestamp"].dt.tz_convert(TIMEZONE)
+    # Convert all timestamps to New York time.
+    df["timestamp"] = (
+        df["timestamp"]
+        .dt.tz_convert(TIMEZONE)
+    )
 
-    # ============================================================
-    # 6. WARM-UP + DATE RANGE
-    # ============================================================
+    # ========================================================
+    # 7. WARM-UP + AVAILABLE DATE RANGE
+    # ========================================================
 
-    warmup_start = DATA_START - pd.Timedelta(days=WARMUP_DAYS)
+    warmup_start = (
+        DATA_START
+        - pd.Timedelta(days=WARMUP_DAYS)
+    )
 
     df = df[
-        (df["timestamp"] >= warmup_start) &
-        (df["timestamp"] <= DATA_END)
+        (df["timestamp"] >= warmup_start)
+        & (df["timestamp"] <= DATA_END)
     ].copy()
 
-    if df.empty or df["timestamp"].max() < DATA_START:
-        print(f"Skipping {symbol}: no usable data")
-        continue
-
-
-    # ============================================================
-    # 7. CALCULATE SCREENER INPUTS
-    # ============================================================
-
-    # Trading-session date in New York time.
-    # This prevents overnight/timezone differences from affecting
-    # the daily calculations.
-    df["session_date"] = df["timestamp"].dt.date
-
-    # ------------------------------------------------------------
-    # Daily volume
-    # ------------------------------------------------------------
-    #
-    # Calculate total volume for each trading session, then create
-    # the 10-session average used by the screener.
-    #
-    # min_periods=10 means a stock needs 10 completed sessions
-    # before it can qualify. The warm-up period above supplies those
-    # sessions without allowing pre-2025 data into the simulation.
-    #
-
-    daily_volume = (
-        df.groupby("session_date", sort=True)["volume"]
-        .sum()
-        .rename("daily_volume")
-    )
-
-    daily_volume_df = daily_volume.to_frame()
-
-    daily_volume_df["avg_10d_volume"] = (
-        daily_volume_df["daily_volume"]
-        .rolling(window=10, min_periods=10)
-        .mean()
-    )
-
-    # ------------------------------------------------------------
-    # Map the 10-day average volume back to every 1-minute bar
-    # ------------------------------------------------------------
-
-    df = df.merge(
-        daily_volume_df[["avg_10d_volume"]],
-        left_on="session_date",
-        right_index=True,
-        how="left",
-    )
-
-    # ------------------------------------------------------------
-    # Current session cumulative volume
-    # ------------------------------------------------------------
-
-    df["session_volume"] = (
-        df.groupby("session_date")["volume"]
-        .cumsum()
-    )
-
-    # ------------------------------------------------------------
-    # Relative volume
-    # ------------------------------------------------------------
-    #
-    # Compare the current cumulative session volume against the
-    # expected volume at the same point in the trading session.
-    #
-    # The calculation below uses the 10-session average daily
-    # volume as the denominator and scales it by elapsed regular-
-    # market minutes.
-    #
-
-    market_open_minutes = (
-        df["timestamp"].dt.hour * 60
-        + df["timestamp"].dt.minute
-        - (9 * 60 + 30)
-        + 1
-    )
-
-    market_open_minutes = market_open_minutes.clip(lower=1, upper=390)
-
-    expected_volume = (
-        df["avg_10d_volume"]
-        * (market_open_minutes / 390.0)
-    )
-
-    df["relative_volume"] = (
-        df["session_volume"] / expected_volume
-    )
-
-    # ------------------------------------------------------------
-    # Previous candle high
-    # ------------------------------------------------------------
-
-    df["previous_high"] = df["high"].shift(1)
-
-    # ------------------------------------------------------------
-    # Keep only the actual 2025+ simulation period.
-    #
-    # The warm-up rows were needed to calculate the rolling inputs,
-    # but they are not eligible to generate trades or be saved.
-    # ------------------------------------------------------------
-
-    df = df[df["timestamp"] >= DATA_START].copy()
-
     if df.empty:
-        print(f"Skipping {symbol}: no data from 2025 onward")
+
+        print(
+            f"Skipping {symbol}: no usable data"
+        )
+
+        del df
+        gc.collect()
+
         continue
 
+    # ========================================================
+    # 8. SESSION INFORMATION
+    # ========================================================
 
-    # ============================================================
-    # 8. APPLY HARD-CODED SCREENER
-    # ============================================================
+    # Session date is based entirely on New York time.
 
-    # Screener requirements:
-    #
-    # 1. Average 10-day volume > 1,000,000
-    # 2. Close × average 10-day volume > 1,000,000
-    # 3. Relative volume > 2
-    # 4. Close price between $0.50 and $20.00 inclusive
-    #
-    # Every bar is evaluated independently.
-    # Only bars passing ALL conditions are qualified.
-
-    df["qualified"] = (
-        (df["avg_10d_volume"] > 1_000_000)
-        & (
-            df["close"] * df["avg_10d_volume"]
-            > 1_000_000
-        )
-        & (df["relative_volume"] > 2)
-        & (df["close"] >= 0.50)
-        & (df["close"] <= 20.00)
+    df["session_date"] = (
+        df["timestamp"].dt.date
     )
 
-    # ------------------------------------------------------------
-    # Entry condition
-    # ------------------------------------------------------------
-    #
-    # A trade opportunity exists only when:
-    #
-    #   - the current bar passes the screener
-    #   - current high > previous 1-minute high
-    #
-    # The actual entry price is calculated later.
-    #
+    # Create a numeric session ID for Numba.
 
-    df["entry_signal"] = (
-        df["qualified"]
-        & df["previous_high"].notna()
-        & (df["high"] > df["previous_high"])
+    session_codes, _ = pd.factorize(
+        df["session_date"],
+        sort=False,
     )
 
-    qualified_count = int(df["qualified"].sum())
-    entry_count = int(df["entry_signal"].sum())
-
-    print(
-        f"{symbol}: "
-        f"{qualified_count:,} qualified bars, "
-        f"{entry_count:,} entry signals"
+    df["session_id"] = (
+        session_codes.astype(np.int64)
     )
 
+    session_group = df.groupby(
+        "session_date",
+        sort=False,
+    )
 
-
-
-        # ============================================================
-    # 9. IDENTIFY TRADING SESSIONS + SESSION FINAL BARS
-    # ============================================================
-
-    # The data has already been converted to New York time.
-    # Therefore each session is determined from the New York date.
-
-    # ------------------------------------------------------------
-    # Identify the first and last bar of every session
-    # ------------------------------------------------------------
-
-    session_group = df.groupby("session_date", sort=False)
+    # --------------------------------------------------------
+    # Session first/last timestamps
+    # --------------------------------------------------------
 
     df["session_first_timestamp"] = (
         session_group["timestamp"]
@@ -323,392 +541,482 @@ for symbol in stock_symbols:
         .transform("last")
     )
 
-    # True only on the actual final bar available for that stock
-    # on that trading session.
+    # --------------------------------------------------------
+    # Actual final bar of each session
+    # --------------------------------------------------------
+
     df["is_session_final_bar"] = (
-        df["timestamp"] == df["session_last_timestamp"]
+        df["timestamp"]
+        == df["session_last_timestamp"]
     )
 
-    # ------------------------------------------------------------
-    # Session-open price
-    # ------------------------------------------------------------
-    #
-    # Used later to calculate:
-    #
-    #   undelayed percentage change
-    #
-    # from the session's first bar open to the current bar close.
-    #
+    # --------------------------------------------------------
+    # Session open
+    # --------------------------------------------------------
 
     df["session_open"] = (
         session_group["open"]
         .transform("first")
     )
 
-    # ------------------------------------------------------------
-    # Highest price reached after an entry
-    # ------------------------------------------------------------
-    #
-    # This column is NOT used to calculate the trailing stop yet.
-    # It is created here as a placeholder for the trade simulation,
-    # where the high reached after entry will be tracked bar by bar.
-    #
-    # Each trade will maintain its own independent highest price.
-    # Therefore there is no portfolio-level state.
-    # ------------------------------------------------------------
+    # ========================================================
+    # 9. DAILY VOLUME + 10-DAY AVERAGE
+    # ========================================================
 
-    # ------------------------------------------------------------
-    # Verify that session boundaries are valid
-    # ------------------------------------------------------------
+    daily_volume = (
+        df.groupby(
+            "session_date",
+            sort=True,
+        )["volume"]
+        .sum()
+        .rename("daily_volume")
+    )
 
-    invalid_sessions = df[
-        df["session_first_timestamp"].isna()
-        | df["session_last_timestamp"].isna()
-        | df["session_open"].isna()
-    ]
+    daily_volume_df = (
+        daily_volume.to_frame()
+    )
 
-    if not invalid_sessions.empty:
+    # This is an estimation using the rolling 10-session
+    # volume, including the current session.
+
+    daily_volume_df[
+        "avg_10d_volume"
+    ] = (
+        daily_volume_df["daily_volume"]
+        .rolling(
+            window=10,
+            min_periods=10,
+        )
+        .mean()
+    )
+
+    # Map the daily estimate back to every minute.
+
+    df = df.merge(
+        daily_volume_df[
+            ["avg_10d_volume"]
+        ],
+        left_on="session_date",
+        right_index=True,
+        how="left",
+    )
+
+    # ========================================================
+    # 10. CURRENT SESSION VOLUME
+    # ========================================================
+
+    df["session_volume"] = (
+        df.groupby("session_date")["volume"]
+        .cumsum()
+    )
+
+    # ========================================================
+    # 11. ESTIMATED RELATIVE VOLUME
+    # ========================================================
+
+    market_open_minutes = (
+        df["timestamp"].dt.hour * 60
+        + df["timestamp"].dt.minute
+        - (9 * 60 + 30)
+        + 1
+    )
+
+    market_open_minutes = (
+        market_open_minutes
+        .clip(lower=1, upper=390)
+    )
+
+    expected_volume = (
+        df["avg_10d_volume"]
+        * (market_open_minutes / 390.0)
+    )
+
+    df["relative_volume"] = (
+        df["session_volume"]
+        / expected_volume
+    )
+
+    # ========================================================
+    # 12. PREVIOUS 1-MINUTE HIGH
+    # ========================================================
+
+    # Previous high is calculated within each stock's session,
+    # so the first bar of a session does not compare against the
+    # previous day's final candle.
+
+    df["previous_high"] = (
+        df.groupby("session_date")["high"]
+        .shift(1)
+    )
+
+    # ========================================================
+    # 13. KEEP ONLY 2025+ DATA FOR SIMULATION
+    # ========================================================
+
+    df = df[
+        df["timestamp"] >= DATA_START
+    ].copy()
+
+    if df.empty:
+
         print(
-            f"Warning: {symbol} has "
-            f"{invalid_sessions['session_date'].nunique():,} "
-            f"invalid session(s)"
+            f"Skipping {symbol}: "
+            f"no data from 2025 onward"
         )
 
-    session_count = df["session_date"].nunique()
+        del df
+        gc.collect()
+
+        continue
+
+    # Recreate contiguous index after filtering.
+
+    df = (
+        df
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+
+    # ========================================================
+    # 14. APPLY HARD-CODED SCREENER
+    # ========================================================
+
+    df["qualified"] = (
+        (df["avg_10d_volume"] > 1_000_000)
+        &
+        (
+            df["close"]
+            * df["avg_10d_volume"]
+            > 1_000_000
+        )
+        &
+        (df["relative_volume"] > 2)
+        &
+        (df["close"] >= 0.50)
+        &
+        (df["close"] <= 20.00)
+    )
+
+    # ========================================================
+    # 15. ENTRY CONDITION
+    # ========================================================
+
+    df["entry_signal"] = (
+        df["qualified"]
+        &
+        df["previous_high"].notna()
+        &
+        (
+            df["high"]
+            > df["previous_high"]
+        )
+    )
+
+    qualified_count = int(
+        df["qualified"].sum()
+    )
+
+    entry_count = int(
+        df["entry_signal"].sum()
+    )
 
     print(
         f"{symbol}: "
-        f"{session_count:,} trading sessions identified"
+        f"{qualified_count:,} qualified bars, "
+        f"{entry_count:,} entry signals"
     )
 
+    # ========================================================
+    # 16. SKIP STOCKS WITH NOTHING TO SIMULATE
+    # ========================================================
 
-    # ============================================================
-    # 10. TP / TSL CONFIGURATIONS
-    # ============================================================
+    if qualified_count == 0:
 
-    # Every combination is simulated independently.
-    #
-    # There is:
-    #   - no shared position
-    #   - no shared capital
-    #   - no buying power
-    #   - no portfolio balance
-    #   - no interaction between simulations
-    #
-    # TP and TSL values are stored as decimal percentages.
+        print(
+            f"Skipping {symbol}: "
+            f"0 qualified bars"
+        )
 
-    TP_TSL_CONFIGS = [
-        (0.05, 0.10),  # TP 5%,  TSL 10%
-        (0.05, 0.05),  # TP 5%,  TSL 5%
-        (0.10, 0.05),  # TP 10%, TSL 5%
-        (0.10, 0.10),  # TP 10%, TSL 10%
-        (0.20, 0.10),  # TP 20%, TSL 10%
-        (0.20, 0.15),  # TP 20%, TSL 15%
-        (0.30, 0.05),  # TP 30%, TSL 5%
-        (0.30, 0.10),  # TP 30%, TSL 10%
-        (0.30, 0.20),  # TP 30%, TSL 20%
-    ]
+        del df
+        gc.collect()
 
-    # ------------------------------------------------------------
-    # History output directory
-    # ------------------------------------------------------------
+        continue
 
-    HISTORY_DIR = "history"
+    if entry_count == 0:
 
-    os.makedirs(HISTORY_DIR, exist_ok=True)
+        print(
+            f"Skipping {symbol}: "
+            f"0 entry signals"
+        )
 
-    print(
-        f"{symbol}: "
-        f"{len(TP_TSL_CONFIGS)} independent TP/TSL simulations"
+        del df
+        gc.collect()
+
+        continue
+
+    # ========================================================
+    # 17. PREPARE NUMBA ARRAYS
+    # ========================================================
+
+    high_array = (
+        df["high"]
+        .to_numpy(dtype=np.float64)
     )
 
+    low_array = (
+        df["low"]
+        .to_numpy(dtype=np.float64)
+    )
 
-    # ============================================================
-    # 11. RUN INDEPENDENT TP / TSL SIMULATIONS
-    # ============================================================
+    close_array = (
+        df["close"]
+        .to_numpy(dtype=np.float64)
+    )
+
+    entry_signal_array = (
+        df["entry_signal"]
+        .to_numpy(dtype=np.bool_)
+    )
+
+    session_id_array = (
+        df["session_id"]
+        .to_numpy(dtype=np.int64)
+    )
+
+    session_final_array = (
+        df["is_session_final_bar"]
+        .to_numpy(dtype=np.bool_)
+    )
+
+    session_open_array = (
+        df["session_open"]
+        .to_numpy(dtype=np.float64)
+    )
+
+    timestamps = (
+        df["timestamp"]
+        .reset_index(drop=True)
+    )
+
+    # ========================================================
+    # 18. CREATE HISTORY BASE
+    # ========================================================
+
+    history_base = df[
+        df["qualified"]
+    ].copy()
+
+    history_base = (
+        history_base
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+
+    # Keep the qualified rows' original dataframe indices
+    # so Numba results can be attached to the correct bars.
+
+    qualified_indices = (
+        df.index[
+            df["qualified"]
+        ]
+        .to_numpy(dtype=np.int64)
+    )
+
+    # ========================================================
+    # 19. RUN ALL NINE INDEPENDENT TP / TSL SIMULATIONS
+    # ========================================================
 
     for tp_pct, tsl_pct in TP_TSL_CONFIGS:
 
         print(
             f"{symbol}: "
-            f"running TP {tp_pct:.0%} / TSL {tsl_pct:.0%}"
+            f"running TP {tp_pct:.0%} / "
+            f"TSL {tsl_pct:.0%}"
         )
 
-        # --------------------------------------------------------
-        # Create history columns.
-        #
-        # Every screener-qualified bar is retained.
-        # Trade columns remain empty unless that bar generates
-        # an entry.
-        # --------------------------------------------------------
-
-        history = df[df["qualified"]].copy()
-
-        history["trade_created"] = False
-        history["entry_price"] = np.nan
-        history["take_profit_price"] = np.nan
-        history["trailing_stop_price"] = np.nan
-        history["highest_price_after_entry"] = np.nan
-        history["exit_price"] = np.nan
-        history["trade_profit_pct"] = np.nan
-        history["trade_hold_minutes"] = np.nan
-        history["exit_reason"] = pd.NA
-
-        # --------------------------------------------------------
-        # Every qualifying entry is an independent trade.
-        #
-        # There is intentionally NO position dictionary, balance,
-        # buying power, allocation, or portfolio state.
-        # --------------------------------------------------------
-
-        trade_records = []
-
-        entry_indices = df.index[
-            df["entry_signal"]
-        ].tolist()
-
-        # --------------------------------------------------------
-        # Process each entry independently.
-        # --------------------------------------------------------
-
-        for entry_idx in entry_indices:
-
-            entry_row = df.loc[entry_idx]
-
-            entry_price = (
-                entry_row["high"] * 1.0025
-            )
-
-            take_profit_price = (
-                entry_price * (1.0 + tp_pct)
-            )
-
-            entry_session = entry_row["session_date"]
-
-            # Only subsequent bars from the SAME trading session
-            # are considered. A trade cannot continue into another
-            # session.
-            
-            # ----------------------------------------------------
-            # Only bars AFTER the entry candle can manage the trade.
-            #
-            # The entry occurs at:
-            #
-            #     current candle high × 1.0025
-            #
-            # Therefore the entry candle itself cannot trigger an
-            # exit after the entry.
-            # ----------------------------------------------------
-
-            subsequent = df.loc[
-                (df.index > entry_idx)
-                & (df["session_date"] == entry_session)
-            ].copy()
-
-            highest_price = entry_price
-
-            exit_price = np.nan
-            exit_reason = None
-            exit_timestamp = None
-
-            # ----------------------------------------------------
-            # Track the trade bar by bar.
-            # ----------------------------------------------------
-
-            for future_idx, future_row in subsequent.iterrows():
-
-                bar_high = future_row["high"]
-                bar_low = future_row["low"]
-
-                # ------------------------------------------------
-                # 1. If this is the actual final bar of the
-                # session, liquidate at that bar's CLOSE.
-                # ------------------------------------------------
-
-                if future_row["is_session_final_bar"]:
-
-                    exit_price = future_row["close"]
-                    exit_reason = "SESSION_END_LIQUIDATION"
-                    exit_timestamp = future_row["timestamp"]
-
-                    break
-
-                # ------------------------------------------------
-                # 2. Update highest price reached after entry.
-                # ------------------------------------------------
-
-                if bar_high > highest_price:
-                    highest_price = bar_high
-
-                trailing_stop_price = (
-                    highest_price * (1.0 - tsl_pct)
-                )
-
-                # ------------------------------------------------
-                # 3. Take-profit
-                # ------------------------------------------------
-
-                if bar_high >= take_profit_price:
-
-                    exit_price = take_profit_price
-                    exit_reason = "TAKE_PROFIT"
-                    exit_timestamp = future_row["timestamp"]
-
-                    break
-
-                # ------------------------------------------------
-                # 4. Trailing stop
-                # ------------------------------------------------
-
-                if bar_low <= trailing_stop_price:
-
-                    exit_price = trailing_stop_price
-                    exit_reason = "TRAILING_STOP"
-                    exit_timestamp = future_row["timestamp"]
-
-                    break
-
-            # ----------------------------------------------------
-            # Safety fallback.
-            #
-            # This should only occur if the entry itself happens
-            # on the final available bar, leaving no subsequent
-            # bar to process.
-            # ----------------------------------------------------
-
-            if exit_reason is None:
-
-                if entry_row["is_session_final_bar"]:
-
-                    exit_price = entry_row["close"]
-                    exit_reason = "SESSION_END_LIQUIDATION"
-                    exit_timestamp = entry_row["timestamp"]
-
-                else:
-                    print(
-                        f"Warning: {symbol} entry at "
-                        f"{entry_row['timestamp']} "
-                        f"did not receive an exit"
-                    )
-
-                    continue
-
-            # ----------------------------------------------------
-            # Trade calculations
-            # ----------------------------------------------------
-
-            trade_profit_pct = (
-                (exit_price - entry_price)
-                / entry_price
-                * 100.0
-            )
-
-            hold_minutes = (
-                (
-                    exit_timestamp
-                    - entry_row["timestamp"]
-                ).total_seconds()
-                / 60.0
-            )
-
-            # ----------------------------------------------------
-            # Undelayed session performance
-            #
-            # From the actual session open to the current/exit
-            # bar's close.
-            # ----------------------------------------------------
-
-            session_open = entry_row["session_open"]
-
-            undelayed_pct_change = (
-                (entry_row["close"] - session_open)
-                / session_open
-                * 100.0
-            )
-
-            # ----------------------------------------------------
-            # Store the complete trade record.
-            # ----------------------------------------------------
-
-            trade_records.append(
-                {
-                    "entry_index": entry_idx,
-                    "entry_timestamp": entry_row["timestamp"],
-                    "entry_price": entry_price,
-                    "take_profit_price": take_profit_price,
-                    "trailing_stop_price": (
-                        highest_price * (1.0 - tsl_pct)
-                    ),
-                    "highest_price_after_entry": highest_price,
-                    "exit_timestamp": exit_timestamp,
-                    "exit_price": exit_price,
-                    "trade_profit_pct": trade_profit_pct,
-                    "trade_hold_minutes": hold_minutes,
-                    "exit_reason": exit_reason,
-                    "undelayed_pct_change": (
-                        undelayed_pct_change
-                    ),
-                }
-            )
-
-        # --------------------------------------------------------
-        # Attach trade information to the qualified entry bars.
-        # --------------------------------------------------------
-
-        for trade in trade_records:
-
-            idx = trade["entry_index"]
-
-            history.loc[idx, "trade_created"] = True
-            history.loc[idx, "entry_price"] = trade["entry_price"]
-            history.loc[idx, "take_profit_price"] = (
-                trade["take_profit_price"]
-            )
-            history.loc[idx, "trailing_stop_price"] = (
-                trade["trailing_stop_price"]
-            )
-            history.loc[idx, "highest_price_after_entry"] = (
-                trade["highest_price_after_entry"]
-            )
-            history.loc[idx, "exit_price"] = trade["exit_price"]
-            history.loc[idx, "trade_profit_pct"] = (
-                trade["trade_profit_pct"]
-            )
-            history.loc[idx, "trade_hold_minutes"] = (
-                trade["trade_hold_minutes"]
-            )
-            history.loc[idx, "exit_reason"] = (
-                trade["exit_reason"]
-            )
-
-        print(
-            f"{symbol}: "
-            f"TP {tp_pct:.0%} / TSL {tsl_pct:.0%} -> "
-            f"{len(trade_records):,} trades"
+        (
+            trade_created,
+            entry_price,
+            take_profit_price,
+            trailing_stop_price,
+            highest_price,
+            exit_price,
+            trade_profit_pct,
+            trade_hold_minutes_index,
+            exit_reason_code,
+            exit_index,
+            n_trades,
+        ) = simulate_trades(
+            high_array,
+            low_array,
+            close_array,
+            entry_signal_array,
+            session_id_array,
+            session_final_array,
+            session_open_array,
+            tp_pct,
+            tsl_pct,
         )
 
+        # ----------------------------------------------------
+        # Create history from EVERY qualified bar.
+        # ----------------------------------------------------
 
-        # ========================================================
-        # 12. FINALIZE + SAVE HISTORY FILE
-        # ========================================================
+        history = history_base.copy()
 
-        # --------------------------------------------------------
-        # Add stock and simulation identifiers.
-        # --------------------------------------------------------
+        # ----------------------------------------------------
+        # Add stock/simulation identifiers.
+        # ----------------------------------------------------
 
         history["symbol"] = symbol
-        history["tp_pct"] = tp_pct * 100.0
-        history["tsl_pct"] = tsl_pct * 100.0
 
-        # --------------------------------------------------------
-        # Undelayed percentage change for EVERY qualified bar.
+        history["tp_pct"] = (
+            tp_pct * 100.0
+        )
+
+        history["tsl_pct"] = (
+            tsl_pct * 100.0
+        )
+
+        # ----------------------------------------------------
+        # Trade fields for qualified bars.
         #
-        # This is based on:
+        # First create full-length arrays, then select the
+        # qualified rows.
+        # ----------------------------------------------------
+
+        history["trade_created"] = (
+            trade_created[
+                qualified_indices
+            ]
+        )
+
+        history["entry_price"] = (
+            entry_price[
+                qualified_indices
+            ]
+        )
+
+        history["take_profit_price"] = (
+            take_profit_price[
+                qualified_indices
+            ]
+        )
+
+        history["trailing_stop_price"] = (
+            trailing_stop_price[
+                qualified_indices
+            ]
+        )
+
+        history["highest_price_after_entry"] = (
+            highest_price[
+                qualified_indices
+            ]
+        )
+
+        history["exit_price"] = (
+            exit_price[
+                qualified_indices
+            ]
+        )
+
+        history["trade_profit_pct"] = (
+            trade_profit_pct[
+                qualified_indices
+            ]
+        )
+
+        # ----------------------------------------------------
+        # Calculate actual holding minutes from timestamps.
         #
-        #     session open -> current bar close
+        # Numba stores the exit bar index, then pandas calculates
+        # the real timestamp difference.
+        # ----------------------------------------------------
+
+        qualified_exit_indices = (
+            exit_index[
+                qualified_indices
+            ]
+        )
+
+        hold_minutes = np.full(
+            len(history),
+            np.nan,
+            dtype=np.float64,
+        )
+
+        entry_timestamps = (
+            history["timestamp"]
+            .reset_index(drop=True)
+        )
+
+        for row_number, exit_idx in enumerate(
+            qualified_exit_indices
+        ):
+
+            if exit_idx >= 0:
+
+                exit_timestamp = (
+                    timestamps.iloc[exit_idx]
+                )
+
+                entry_timestamp = (
+                    entry_timestamps.iloc[row_number]
+                )
+
+                hold_minutes[row_number] = (
+                    (
+                        exit_timestamp
+                        - entry_timestamp
+                    ).total_seconds()
+                    / 60.0
+                )
+
+        history["trade_hold_minutes"] = (
+            hold_minutes
+        )
+
+        # ----------------------------------------------------
+        # Exit reason
+        # ----------------------------------------------------
+
+        reason_values = (
+            exit_reason_code[
+                qualified_indices
+            ]
+        )
+
+        exit_reason = np.full(
+            len(history),
+            None,
+            dtype=object,
+        )
+
+        exit_reason[
+            reason_values == 1
+        ] = "TAKE_PROFIT"
+
+        exit_reason[
+            reason_values == 2
+        ] = "TRAILING_STOP"
+
+        exit_reason[
+            reason_values == 3
+        ] = "SESSION_END_LIQUIDATION"
+
+        history["exit_reason"] = (
+            exit_reason
+        )
+
+        # ----------------------------------------------------
+        # Undelayed percentage change.
         #
-        # It is independent of whether the bar generated a trade.
-        # --------------------------------------------------------
+        # Session open -> CURRENT BAR CLOSE.
+        #
+        # This is calculated for every qualified bar, regardless
+        # of whether it generated a trade.
+        # ----------------------------------------------------
 
         history["undelayed_pct_change"] = (
             (
@@ -719,18 +1027,9 @@ for symbol in stock_symbols:
             * 100.0
         )
 
-        # --------------------------------------------------------
-        # Explicitly identify whether the qualified bar generated
-        # an entry.
-        # --------------------------------------------------------
-
-        history["entry_signal"] = history["entry_signal"].astype(bool)
-
-        # --------------------------------------------------------
-        # Select the columns that belong in the history.
-        #
-        # Each row represents one screener-qualified 1-minute bar.
-        # --------------------------------------------------------
+        # ----------------------------------------------------
+        # Select final history columns.
+        # ----------------------------------------------------
 
         HISTORY_COLUMNS = [
             "symbol",
@@ -772,73 +1071,100 @@ for symbol in stock_symbols:
             "undelayed_pct_change",
         ]
 
-        history = history[HISTORY_COLUMNS].copy()
+        history = (
+            history[HISTORY_COLUMNS]
+            .copy()
+        )
 
-        # --------------------------------------------------------
-        # Sort chronologically.
-        # --------------------------------------------------------
+        history = (
+            history
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
 
-        history = history.sort_values(
-            "timestamp"
-        ).reset_index(drop=True)
+        # ====================================================
+        # 20. SAVE HISTORY DIRECTLY TO R2
+        # ====================================================
 
-        # --------------------------------------------------------
-        # Construct the required filename.
-        #
-        # Examples:
-        #
-        # AAPL_tp5_tsl10.parquet
-        # AAPL_tp20_tsl15.parquet
-        # --------------------------------------------------------
+        tp_label = int(
+            tp_pct * 100
+        )
 
-        tp_label = int(tp_pct * 100)
-        tsl_label = int(tsl_pct * 100)
+        tsl_label = int(
+            tsl_pct * 100
+        )
 
         output_filename = (
             f"{symbol}_tp{tp_label}_tsl{tsl_label}.parquet"
         )
 
-        output_path = os.path.join(
-            HISTORY_DIR,
-            output_filename,
+        output_key = (
+            f"{HISTORY_PREFIX}/"
+            f"{output_filename}"
         )
 
-        # --------------------------------------------------------
-        # Save the independent history.
-        # --------------------------------------------------------
+        # Serialize Parquet directly into memory.
+        # Nothing is written to the laptop's disk.
+
+        parquet_buffer = io.BytesIO()
 
         history.to_parquet(
-            output_path,
+            parquet_buffer,
             engine="pyarrow",
             index=False,
         )
 
-        print(
-            f"Saved: {output_path} "
-            f"({len(history):,} qualified bars)"
+        parquet_buffer.seek(0)
+
+        s3.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=output_key,
+            Body=parquet_buffer.getvalue(),
+            ContentType="application/octet-stream",
         )
 
-        # --------------------------------------------------------
-        # Release the history dataframe before moving to the next
-        # TP/TSL configuration.
-        # --------------------------------------------------------
+        print(
+            f"Saved to R2: "
+            f"{output_key} "
+            f"({len(history):,} qualified bars, "
+            f"{n_trades:,} trades)"
+        )
+
+        # ----------------------------------------------------
+        # Release this simulation's history.
+        # ----------------------------------------------------
 
         del history
+        del parquet_buffer
+
         gc.collect()
 
+    # ========================================================
+    # 21. FINISH STOCK
+    # ========================================================
 
-
-    # ============================================================
-    # 13. FINISH STOCK PROCESSING
-    # ============================================================
-
-    # Release the stock dataframe before moving to the next stock.
+    del history_base
+    del high_array
+    del low_array
+    del close_array
+    del entry_signal_array
+    del session_id_array
+    del session_final_array
+    del session_open_array
+    del qualified_indices
+    del timestamps
     del df
+
     gc.collect()
 
     print(
         f"Finished {symbol}"
     )
-    print("-" * 60)
 
+
+# ============================================================
+# 22. FINISH
+# ============================================================
+
+print()
 print("All stocks processed.")
