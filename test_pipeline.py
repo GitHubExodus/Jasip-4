@@ -41,15 +41,21 @@ train["target"] = profits.reindex(train.index)
 
 ranking = SplitRanking(
     train,
-    local_dir="data/splits",
-    bucket="stocks-data",
-    cloud_folder="jasip4/splits"
+    validation,
+    testing
 )
 
-ranking.run()
+training_ranking, validation_ranking, testing_ranking = ranking.run()
+
 ranking.save()
 
-print("\nTop splits:")
-print(ranking.ranking.head(30))
+print("\nTraining ranking:")
+print(training_ranking.head(30))
+
+print("\nValidation ranking:")
+print(validation_ranking.head(30))
+
+print("\nTesting ranking:")
+print(testing_ranking.head(30))
 
 print("\nSplit ranking saved locally and to R2")

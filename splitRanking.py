@@ -7,12 +7,17 @@ import pandas as pd
 class SplitRanking:
     def __init__(
         self,
-        data,
+        train,
+        validation,
+        testing,
         local_dir="data/splits",
         bucket="stocks-data",
         cloud_folder="jasip4/splits"
     ):
-        self.data = data.copy()
+        self.train = train.copy()
+        self.validation = validation.copy()
+        self.testing = testing.copy()
+
         self.local_dir = local_dir
         self.bucket = bucket
         self.cloud_folder = cloud_folder
@@ -26,15 +31,15 @@ class SplitRanking:
             aws_secret_access_key="3e92e25062abc6fe86c13455712967444aa1ffa3492d1d81258f7f4ecd5923aa"
         )
 
-    def run(self):
-        target = self.data["target"].to_numpy(dtype=np.float64)
+    def find_splits(self):
+        target = self.train["target"].to_numpy(dtype=np.float64)
 
-        features = self.data.drop(
+        features = self.train.drop(
             columns=["target", "stock"],
             errors="ignore"
         )
 
-        results = []
+        splits = []
 
         for feature in features.columns:
             values = features[feature].to_numpy(dtype=np.float64)
@@ -42,76 +47,131 @@ class SplitRanking:
             valid = np.isfinite(values) & np.isfinite(target)
 
             values = values[valid]
-            profits = target[valid]
 
             if len(values) < 2:
                 continue
 
-            order = np.argsort(values)
-            values = values[order]
-            profits = profits[order]
+            values = np.sort(values)
 
-            # Only test splits where the feature value actually changes.
-            changes = np.r_[values[1:] != values[:-1], True]
+            changes = values[1:] != values[:-1]
 
-            split_indexes = np.flatnonzero(changes)
+            indexes = np.flatnonzero(changes)
 
-            cumulative = np.cumsum(profits)
-            total_profit = cumulative[-1]
-
-            for i in split_indexes[:-1]:
+            for i in indexes:
                 split = (values[i] + values[i + 1]) / 2
 
-                yes_profit = cumulative[i]
-                no_profit = total_profit - yes_profit
-
-                yes_count = i + 1
-                no_count = len(values) - yes_count
-
-                results.append({
+                splits.append({
                     "feature": feature,
                     "condition": "<=",
-                    "split": split,
-                    "bars": yes_count,
-                    "total_profit": yes_profit,
-                    "average_profit": yes_profit / yes_count
+                    "split": split
                 })
 
-                results.append({
+                splits.append({
                     "feature": feature,
                     "condition": ">",
-                    "split": split,
-                    "bars": no_count,
-                    "total_profit": no_profit,
-                    "average_profit": no_profit / no_count
+                    "split": split
                 })
+
+        return pd.DataFrame(splits)
+
+    def evaluate(self, data, splits):
+        results = []
+
+        for _, row in splits.iterrows():
+            feature = row["feature"]
+            condition = row["condition"]
+            split = row["split"]
+
+            values = data[feature].to_numpy(dtype=np.float64)
+            target = data["target"].to_numpy(dtype=np.float64)
+
+            valid = np.isfinite(values) & np.isfinite(target)
+
+            values = values[valid]
+            target = target[valid]
+
+            if condition == "<=":
+                yes = values <= split
+            else:
+                yes = values > split
+
+            yes_profit = target[yes].sum()
+            yes_bars = yes.sum()
+
+            results.append({
+                "feature": feature,
+                "condition": condition,
+                "split": split,
+                "bars": yes_bars,
+                "total_profit": yes_profit,
+                "average_profit": (
+                    yes_profit / yes_bars
+                    if yes_bars > 0
+                    else np.nan
+                )
+            })
 
         ranking = pd.DataFrame(results)
 
-        ranking = ranking.sort_values(
+        return ranking.sort_values(
             "total_profit",
             ascending=False
         ).reset_index(drop=True)
 
-        ranking["rank"] = np.arange(1, len(ranking) + 1)
+    def run(self):
+        splits = self.find_splits()
 
-        self.ranking = ranking
-
-        return ranking
-
-    def save(self):
-        file = f"{self.local_dir}/split_ranking.parquet"
-
-        self.ranking.to_parquet(
-            file,
-            index=False
+        self.training = self.evaluate(
+            self.train,
+            splits
         )
 
-        with open(file, "rb") as f:
-            self.s3.put_object(
-                Bucket=self.bucket,
-                Key=f"{self.cloud_folder}/split_ranking.parquet",
-                Body=f.read()
+        self.validation = self.evaluate(
+            self.validation,
+            splits
+        )
+
+        self.testing = self.evaluate(
+            self.testing,
+            splits
+        )
+
+        self.training["rank"] = np.arange(
+            1, len(self.training) + 1
+        )
+
+        self.validation["rank"] = np.arange(
+            1, len(self.validation) + 1
+        )
+
+        self.testing["rank"] = np.arange(
+            1, len(self.testing) + 1
+        )
+
+        return (
+            self.training,
+            self.validation,
+            self.testing
+        )
+
+    def save(self):
+        files = {
+            "training_split_ranking.parquet": self.training,
+            "validation_split_ranking.parquet": self.validation,
+            "testing_split_ranking.parquet": self.testing
+        }
+
+        for name, data in files.items():
+            local_file = f"{self.local_dir}/{name}"
+
+            data.to_parquet(
+                local_file,
+                index=False
             )
 
-        return file
+            with open(local_file, "rb") as f:
+                self.s3.put_object(
+                    Bucket=self.bucket,
+                    Key=f"{self.cloud_folder}/{name}",
+                    Body=f.read()
+                )
