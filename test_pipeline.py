@@ -67,6 +67,17 @@ print(model.evaluate())
 print("\nFeature usefulness:")
 print(model.feature_usefulness().head(20))
 
+probability = model.predict_probability()
+
+result = testing[["target"]].copy()
+result["probability"] = probability
+
+print(
+    result.sort_values(
+        "probability",
+        ascending=False
+    )
+)
 
 
 # Save model locally AND upload everything to R2
