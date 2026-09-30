@@ -57,7 +57,8 @@ model.train_model(
     max_depth=6,
     learning_rate=0.05,
     subsample=0.8,
-    colsample_bytree=0.8
+    colsample_bytree=0.8,
+    scale_pos_weight=100 / 11
 )
 
 print("\nModel statistics:")
