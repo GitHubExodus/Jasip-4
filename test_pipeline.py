@@ -11,6 +11,7 @@ stock_data = StockLibrary(
     local_dir="data"
 )
 
+
 train, validation, testing, profits = stock_data.run()
 
 print("Data processing complete")
@@ -44,6 +45,7 @@ ranking = SplitRanking(
 )
 
 ranking.run()
+
 ranking.save()
 
 ranking.print_rankings(30)

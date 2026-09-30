@@ -57,14 +57,20 @@ class SplitRanking:
             values = values[order]
             profits = profits[order]
 
-            changes = np.r_[values[1:] != values[:-1], True]
+            changes = np.r_[
+                values[1:] != values[:-1],
+                True
+            ]
+
             split_indexes = np.flatnonzero(changes)
 
             cumulative = np.cumsum(profits)
             total_profit = cumulative[-1]
 
             for i in split_indexes[:-1]:
-                split = (values[i] + values[i + 1]) / 2
+                split = (
+                    values[i] + values[i + 1]
+                ) / 2
 
                 yes_profit = cumulative[i]
                 no_profit = total_profit - yes_profit
@@ -81,55 +87,99 @@ class SplitRanking:
                     "feature": feature,
                     "condition": ">",
                     "split": split,
-                    "training_bars": len(values) - i - 1,
+                    "training_bars": (
+                        len(values) - i - 1
+                    ),
                     "training_profit": no_profit
                 })
 
         return pd.DataFrame(results)
 
     def _test_splits(self, ranking, data, prefix):
-        target = data["target"].to_numpy(dtype=np.float64)
+        target = data["target"].to_numpy(
+            dtype=np.float64
+        )
 
-        for feature in data.drop(
+        features = data.drop(
             columns=["target", "stock"],
             errors="ignore"
-        ).columns:
+        )
 
-            if feature not in ranking["feature"].values:
+        for feature in ranking["feature"].unique():
+
+            if feature not in features.columns:
                 continue
 
-            values = data[feature].to_numpy(dtype=np.float64)
+            values = features[feature].to_numpy(
+                dtype=np.float64
+            )
 
-            for index in ranking.index[
+            feature_rows = ranking.index[
                 ranking["feature"] == feature
-            ]:
-                condition = ranking.at[index, "condition"]
-                split = ranking.at[index, "split"]
+            ]
 
-                valid = np.isfinite(values) & np.isfinite(target)
+            for index in feature_rows:
+                condition = ranking.at[
+                    index,
+                    "condition"
+                ]
+
+                split = ranking.at[
+                    index,
+                    "split"
+                ]
+
+                valid = (
+                    np.isfinite(values)
+                    & np.isfinite(target)
+                )
 
                 if condition == "<=":
-                    selected = valid & (values <= split)
+                    selected = (
+                        valid
+                        & (values <= split)
+                    )
                 else:
-                    selected = valid & (values > split)
+                    selected = (
+                        valid
+                        & (values > split)
+                    )
 
                 profits = target[selected]
 
-                ranking.at[index, f"{prefix}_bars"] = len(profits)
-                ranking.at[index, f"{prefix}_profit"] = (
-                    profits.sum() if len(profits) else 0.0
-                )
-                ranking.at[index, f"{prefix}_average_profit"] = (
-                    profits.mean() if len(profits) else np.nan
+                ranking.at[
+                    index,
+                    f"{prefix}_bars"
+                ] = len(profits)
+
+                ranking.at[
+                    index,
+                    f"{prefix}_profit"
+                ] = (
+                    profits.sum()
+                    if len(profits)
+                    else 0.0
                 )
 
-        ranking[f"{prefix}_profit"] = ranking[
-            f"{prefix}_profit"
-        ].fillna(0.0)
+                ranking.at[
+                    index,
+                    f"{prefix}_average_profit"
+                ] = (
+                    profits.mean()
+                    if len(profits)
+                    else np.nan
+                )
 
-        ranking[f"{prefix}_bars"] = ranking[
-            f"{prefix}_bars"
-        ].fillna(0).astype(int)
+        ranking[f"{prefix}_profit"] = (
+            ranking[f"{prefix}_profit"]
+            .fillna(0.0)
+        )
+
+        ranking[f"{prefix}_bars"] = (
+            ranking[f"{prefix}_bars"]
+            .fillna(0)
+            .astype(int)
+        )
 
         ranking[f"{prefix}_rank"] = (
             ranking[f"{prefix}_profit"]
@@ -143,8 +193,10 @@ class SplitRanking:
         return ranking
 
     def run(self):
+        # Find the actual splits using training only.
         ranking = self._find_training_splits()
 
+        # Test those exact same splits everywhere.
         ranking = self._test_splits(
             ranking,
             self.train,
@@ -163,11 +215,26 @@ class SplitRanking:
             "testing"
         )
 
+        # The worst rank that this split received
+        # across the three datasets.
+        ranking["worst_rank"] = ranking[
+            [
+                "training_rank",
+                "validation_rank",
+                "testing_rank"
+            ]
+        ].max(axis=1)
+
+        # Best worst-case split first.
         ranking = ranking.sort_values(
-            "training_rank"
+            [
+                "worst_rank",
+                "training_rank"
+            ]
         ).reset_index(drop=True)
 
-        ranking["training_rank"] = np.arange(
+        # Overall ranking based on best worst-case rank.
+        ranking["overall_rank"] = np.arange(
             1,
             len(ranking) + 1
         )
@@ -178,28 +245,46 @@ class SplitRanking:
 
     def print_rankings(self, n=30):
         print("\nTRAINING RANKING")
+
         print(
-            self.ranking.sort_values("training_rank")
+            self.ranking
+            .sort_values("training_rank")
             .head(n)
             .to_string(index=False)
         )
 
         print("\nVALIDATION RANKING")
+
         print(
-            self.ranking.sort_values("validation_rank")
+            self.ranking
+            .sort_values("validation_rank")
             .head(n)
             .to_string(index=False)
         )
 
         print("\nTESTING RANKING")
+
         print(
-            self.ranking.sort_values("testing_rank")
+            self.ranking
+            .sort_values("testing_rank")
+            .head(n)
+            .to_string(index=False)
+        )
+
+        print("\nBEST WORST-RANK RANKING")
+
+        print(
+            self.ranking
+            .sort_values("overall_rank")
             .head(n)
             .to_string(index=False)
         )
 
     def save(self):
-        file = f"{self.local_dir}/split_ranking.parquet"
+        file = (
+            f"{self.local_dir}/"
+            "split_ranking.parquet"
+        )
 
         self.ranking.to_parquet(
             file,
@@ -209,7 +294,10 @@ class SplitRanking:
         with open(file, "rb") as f:
             self.s3.put_object(
                 Bucket=self.bucket,
-                Key=f"{self.cloud_folder}/split_ranking.parquet",
+                Key=(
+                    f"{self.cloud_folder}/"
+                    "split_ranking.parquet"
+                ),
                 Body=f.read()
             )
 
