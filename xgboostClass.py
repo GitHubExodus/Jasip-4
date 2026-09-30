@@ -1,6 +1,7 @@
 import os
 import json
 import xgboost as xgb
+import boto3
 import pandas as pd
 
 from sklearn.metrics import (
