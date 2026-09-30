@@ -16,3 +16,16 @@ print("Training:", train.shape)
 print("Validation:", validation.shape)
 print("Testing:", testing.shape)
 print("Profits:", profits.shape)
+
+
+print("\nTRAINING DATA")
+print(train.head(10))
+
+print("\nVALIDATION DATA")
+print(validation.head(10))
+
+print("\nTESTING DATA")
+print(testing.head(10))
+
+print("\nPROFIT DATA")
+print(profits.head(10))
