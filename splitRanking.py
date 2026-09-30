@@ -31,7 +31,7 @@ class SplitRanking:
             aws_secret_access_key="3e92e25062abc6fe86c13455712967444aa1ffa3492d1d81258f7f4ecd5923aa"
         )
 
-    def find_splits(self):
+    def _find_training_splits(self):
         target = self.train["target"].to_numpy(dtype=np.float64)
 
         features = self.train.drop(
@@ -39,7 +39,7 @@ class SplitRanking:
             errors="ignore"
         )
 
-        splits = []
+        results = []
 
         for feature in features.columns:
             values = features[feature].to_numpy(dtype=np.float64)
@@ -47,131 +47,170 @@ class SplitRanking:
             valid = np.isfinite(values) & np.isfinite(target)
 
             values = values[valid]
+            profits = target[valid]
 
             if len(values) < 2:
                 continue
 
-            values = np.sort(values)
+            order = np.argsort(values)
 
-            changes = values[1:] != values[:-1]
+            values = values[order]
+            profits = profits[order]
 
-            indexes = np.flatnonzero(changes)
+            changes = np.r_[values[1:] != values[:-1], True]
+            split_indexes = np.flatnonzero(changes)
 
-            for i in indexes:
+            cumulative = np.cumsum(profits)
+            total_profit = cumulative[-1]
+
+            for i in split_indexes[:-1]:
                 split = (values[i] + values[i + 1]) / 2
 
-                splits.append({
+                yes_profit = cumulative[i]
+                no_profit = total_profit - yes_profit
+
+                results.append({
                     "feature": feature,
                     "condition": "<=",
-                    "split": split
+                    "split": split,
+                    "training_bars": i + 1,
+                    "training_profit": yes_profit
                 })
 
-                splits.append({
+                results.append({
                     "feature": feature,
                     "condition": ">",
-                    "split": split
+                    "split": split,
+                    "training_bars": len(values) - i - 1,
+                    "training_profit": no_profit
                 })
 
-        return pd.DataFrame(splits)
+        return pd.DataFrame(results)
 
-    def evaluate(self, data, splits):
-        results = []
+    def _test_splits(self, ranking, data, prefix):
+        target = data["target"].to_numpy(dtype=np.float64)
 
-        for _, row in splits.iterrows():
-            feature = row["feature"]
-            condition = row["condition"]
-            split = row["split"]
+        for feature in data.drop(
+            columns=["target", "stock"],
+            errors="ignore"
+        ).columns:
+
+            if feature not in ranking["feature"].values:
+                continue
 
             values = data[feature].to_numpy(dtype=np.float64)
-            target = data["target"].to_numpy(dtype=np.float64)
 
-            valid = np.isfinite(values) & np.isfinite(target)
+            for index in ranking.index[
+                ranking["feature"] == feature
+            ]:
+                condition = ranking.at[index, "condition"]
+                split = ranking.at[index, "split"]
 
-            values = values[valid]
-            target = target[valid]
+                valid = np.isfinite(values) & np.isfinite(target)
 
-            if condition == "<=":
-                yes = values <= split
-            else:
-                yes = values > split
+                if condition == "<=":
+                    selected = valid & (values <= split)
+                else:
+                    selected = valid & (values > split)
 
-            yes_profit = target[yes].sum()
-            yes_bars = yes.sum()
+                profits = target[selected]
 
-            results.append({
-                "feature": feature,
-                "condition": condition,
-                "split": split,
-                "bars": yes_bars,
-                "total_profit": yes_profit,
-                "average_profit": (
-                    yes_profit / yes_bars
-                    if yes_bars > 0
-                    else np.nan
+                ranking.at[index, f"{prefix}_bars"] = len(profits)
+                ranking.at[index, f"{prefix}_profit"] = (
+                    profits.sum() if len(profits) else 0.0
                 )
-            })
+                ranking.at[index, f"{prefix}_average_profit"] = (
+                    profits.mean() if len(profits) else np.nan
+                )
 
-        ranking = pd.DataFrame(results)
+        ranking[f"{prefix}_profit"] = ranking[
+            f"{prefix}_profit"
+        ].fillna(0.0)
 
-        return ranking.sort_values(
-            "total_profit",
-            ascending=False
-        ).reset_index(drop=True)
+        ranking[f"{prefix}_bars"] = ranking[
+            f"{prefix}_bars"
+        ].fillna(0).astype(int)
+
+        ranking[f"{prefix}_rank"] = (
+            ranking[f"{prefix}_profit"]
+            .rank(
+                ascending=False,
+                method="min"
+            )
+            .astype(int)
+        )
+
+        return ranking
 
     def run(self):
-        splits = self.find_splits()
+        ranking = self._find_training_splits()
 
-        self.training = self.evaluate(
+        ranking = self._test_splits(
+            ranking,
             self.train,
-            splits
+            "training"
         )
 
-        self.validation = self.evaluate(
+        ranking = self._test_splits(
+            ranking,
             self.validation,
-            splits
+            "validation"
         )
 
-        self.testing = self.evaluate(
+        ranking = self._test_splits(
+            ranking,
             self.testing,
-            splits
+            "testing"
         )
 
-        self.training["rank"] = np.arange(
-            1, len(self.training) + 1
+        ranking = ranking.sort_values(
+            "training_rank"
+        ).reset_index(drop=True)
+
+        ranking["training_rank"] = np.arange(
+            1,
+            len(ranking) + 1
         )
 
-        self.validation["rank"] = np.arange(
-            1, len(self.validation) + 1
+        self.ranking = ranking
+
+        return ranking
+
+    def print_rankings(self, n=30):
+        print("\nTRAINING RANKING")
+        print(
+            self.ranking.sort_values("training_rank")
+            .head(n)
+            .to_string(index=False)
         )
 
-        self.testing["rank"] = np.arange(
-            1, len(self.testing) + 1
+        print("\nVALIDATION RANKING")
+        print(
+            self.ranking.sort_values("validation_rank")
+            .head(n)
+            .to_string(index=False)
         )
 
-        return (
-            self.training,
-            self.validation,
-            self.testing
+        print("\nTESTING RANKING")
+        print(
+            self.ranking.sort_values("testing_rank")
+            .head(n)
+            .to_string(index=False)
         )
 
     def save(self):
-        files = {
-            "training_split_ranking.parquet": self.training,
-            "validation_split_ranking.parquet": self.validation,
-            "testing_split_ranking.parquet": self.testing
-        }
+        file = f"{self.local_dir}/split_ranking.parquet"
 
-        for name, data in files.items():
-            local_file = f"{self.local_dir}/{name}"
+        self.ranking.to_parquet(
+            file,
+            index=False
+        )
 
-            data.to_parquet(
-                local_file,
-                index=False
+        with open(file, "rb") as f:
+            self.s3.put_object(
+                Bucket=self.bucket,
+                Key=f"{self.cloud_folder}/split_ranking.parquet",
+                Body=f.read()
             )
 
-            with open(local_file, "rb") as f:
-                self.s3.put_object(
-                    Bucket=self.bucket,
-                    Key=f"{self.cloud_folder}/{name}",
-                    Body=f.read()
-                )
+        return file
