@@ -139,6 +139,7 @@ class StockLibrary:
         profit = profit[valid]
 
         x["target"] = profit
+        x["stock"] = stock
 
         return x, profit
 

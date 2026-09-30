@@ -19,8 +19,6 @@ print("Validation:", validation.shape)
 print("Testing:", testing.shape)
 print("Profits:", profits.shape)
 
-
-# Save all processed data locally and to R2
 for file in [
     "training.parquet",
     "validation.parquet",
@@ -33,11 +31,6 @@ for file in [
     )
 
 print("Processed data saved to R2")
-
-
-# Use profit directly as the target
-train["target"] = profits.reindex(train.index)
-
 
 ranking = SplitRanking(
     train,
