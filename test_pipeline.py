@@ -11,7 +11,6 @@ stock_data = StockLibrary(
     local_dir="data"
 )
 
-
 train, validation, testing, profits = stock_data.run()
 
 print("Data processing complete")
@@ -36,9 +35,9 @@ print("Processed data saved to R2")
 
 
 ranking = SplitRanking(
-    train,
-    validation,
-    testing,
+    train=train,
+    validation=validation,
+    testing=testing,
     local_dir="data/splits",
     bucket="stocks-data",
     cloud_folder="jasip4/splits"
