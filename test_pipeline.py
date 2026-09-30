@@ -19,6 +19,15 @@ print("Validation:", validation.shape)
 print("Testing:", testing.shape)
 print("Profits:", profits.shape)
 
+print("Training:")
+print(train["target"].value_counts())
+
+print("\nValidation:")
+print(validation["target"].value_counts())
+
+print("\nTesting:")
+print(testing["target"].value_counts())
+
 
 # Save all processed data to R2 ONCE
 for file in [
@@ -56,6 +65,7 @@ print(model.evaluate())
 
 print("\nFeature usefulness:")
 print(model.feature_usefulness().head(20))
+
 
 
 # Save model locally AND upload everything to R2
