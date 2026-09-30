@@ -29,3 +29,17 @@ print(testing.head(10))
 
 print("\nPROFIT DATA")
 print(profits.head(10))
+
+
+
+print("\nTRAINING DATA")
+print(train)
+
+print("\nVALIDATION DATA")
+print(validation)
+
+print("\nTESTING DATA")
+print(testing)
+
+print("\nPROFIT DATA")
+print(profits)
