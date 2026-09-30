@@ -20,7 +20,6 @@ print("Testing:", testing.shape)
 print("Profits:", profits.shape)
 
 
-# Save all processed data locally and to R2
 for file in [
     "training.parquet",
     "validation.parquet",
@@ -35,12 +34,10 @@ for file in [
 print("Processed data saved to R2")
 
 
-# Use profit directly as the target
-train["target"] = profits.reindex(train.index)
-
-
 ranking = SplitRanking(
     train,
+    validation,
+    testing,
     local_dir="data/splits",
     bucket="stocks-data",
     cloud_folder="jasip4/splits"
@@ -49,7 +46,6 @@ ranking = SplitRanking(
 ranking.run()
 ranking.save()
 
-print("\nTop splits:")
-print(ranking.ranking.head(30))
+ranking.print_rankings(30)
 
 print("\nSplit ranking saved locally and to R2")
