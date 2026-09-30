@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "TradingView Screener Bridge",
+  "version": "1.0.0",
+  "description": "Sends TradingView screener data to the local Python trading system.",
+  "permissions": [],
+  "host_permissions": [
+    "https://www.tradingview.com/*",
+    "http://127.0.0.1:8765/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.tradingview.com/*"
+      ],
+      "js": [
+        "config.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
