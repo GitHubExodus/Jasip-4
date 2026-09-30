@@ -171,3 +171,33 @@ class XGBoostLibrary:
         self.model = xgb.XGBClassifier()
         self.model.load_model(file)
         return self.model
+
+
+    def upload_all(self, bucket, cloud_folder):
+        s3 = boto3.client(
+            "s3",
+            endpoint_url="https://98f8e959e677f16bddcf44f609fec6a0.r2.cloudflarestorage.com",
+            aws_access_key_id="f47f48ce0d129b1a69bb36da1d64bad1",
+            aws_secret_access_key="3e92e25062abc6fe86c13455712967444aa1ffa3492d1d81258f7f4ecd5923aa"
+        )
+
+        files = [
+            "xgboost_model.json",
+            "model_stats.parquet",
+            "feature_stats.parquet",
+            "model_params.json"
+        ]
+
+        for file in files:
+            local_file = (
+                self.stats_dir + "/" + file
+                if file != "xgboost_model.json"
+                else "data/xgboost/" + file
+            )
+
+            with open(local_file, "rb") as f:
+                s3.put_object(
+                    Bucket=bucket,
+                    Key=f"{cloud_folder}/{file}",
+                    Body=f.read()
+                )

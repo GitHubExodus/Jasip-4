@@ -1,5 +1,3 @@
-
-
 from main import StockLibrary
 from xgboostClass import XGBoostLibrary
 
@@ -12,6 +10,7 @@ stock_data = StockLibrary(
     validation_percent=0.15,
     local_dir="data"
 )
+
 train, validation, testing, profits = stock_data.run()
 
 print("Data processing complete")
@@ -21,6 +20,22 @@ print("Testing:", testing.shape)
 print("Profits:", profits.shape)
 
 
+# Save all processed data to R2 ONCE
+for file in [
+    "training.parquet",
+    "validation.parquet",
+    "testing.parquet",
+    "profits.parquet"
+]:
+    stock_data.upload(
+        f"data/{file}",
+        f"jasip4/{file}"
+    )
+
+print("Processed data saved to R2")
+
+
+# Train XGBoost
 model = XGBoostLibrary(
     train_file="data/training.parquet",
     validation_file="data/validation.parquet",
@@ -42,6 +57,13 @@ print(model.evaluate())
 print("\nFeature usefulness:")
 print(model.feature_usefulness().head(20))
 
+
+# Save model locally AND upload everything to R2
 model.save()
+
+model.upload_all(
+    bucket="stocks-data",
+    cloud_folder="jasip4/xgboost"
+)
 
 print("\nFull process complete")

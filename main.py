@@ -142,6 +142,14 @@ class StockLibrary:
 
         return x, profit
 
+    def upload(self, local_file, cloud_file):
+        with open(local_file, "rb") as f:
+            self.s3.put_object(
+                Bucket=self.bucket,
+                Key=cloud_file,
+                Body=f.read()
+            )
+
     def run(self):
         objects = self.s3.list_objects_v2(
             Bucket=self.bucket
