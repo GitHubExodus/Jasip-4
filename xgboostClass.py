@@ -42,7 +42,7 @@ class XGBoostLibrary:
         x_val = self.validation.drop(columns=["target", "stock"], errors="ignore")
         y_val = self.validation["target"]
 
-        self.model = xgb.XGBClassifier(
+        self.model = xgb.XGBRegressor(
             **params,
             eval_metric="logloss"
         )
@@ -169,7 +169,7 @@ class XGBoostLibrary:
         self.model.save_model(file)
 
     def load(self, file="data/xgboost/xgboost_model.json"):
-        self.model = xgb.XGBClassifier()
+        self.model = xgb.XGBRegressor()
         self.model.load_model(file)
         return self.model
 

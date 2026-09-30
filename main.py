@@ -138,7 +138,7 @@ class StockLibrary:
         x = x[valid]
         profit = profit[valid]
 
-        x["target"] = (profit > 1).astype(np.int8)
+        x["target"] = profit
 
         return x, profit
 

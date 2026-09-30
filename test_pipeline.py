@@ -19,17 +19,7 @@ print("Validation:", validation.shape)
 print("Testing:", testing.shape)
 print("Profits:", profits.shape)
 
-print("Training:")
-print(train["target"].value_counts())
 
-print("\nValidation:")
-print(validation["target"].value_counts())
-
-print("\nTesting:")
-print(testing["target"].value_counts())
-
-
-# Save all processed data to R2 ONCE
 for file in [
     "training.parquet",
     "validation.parquet",
@@ -44,7 +34,6 @@ for file in [
 print("Processed data saved to R2")
 
 
-# Train XGBoost
 model = XGBoostLibrary(
     train_file="data/training.parquet",
     validation_file="data/validation.parquet",
@@ -52,40 +41,39 @@ model = XGBoostLibrary(
     stats_dir="data/xgboost"
 )
 
+
 model.train_model(
     n_estimators=500,
     max_depth=6,
     learning_rate=0.05,
     subsample=0.8,
-    colsample_bytree=0.8,
-    scale_pos_weight=100 / 11
+    colsample_bytree=0.8
 )
+
 
 print("\nModel statistics:")
 print(model.evaluate())
 
+
 print("\nFeature usefulness:")
-print(model.feature_usefulness().head(20))
-
-probability = model.predict_probability()
-
-result = testing[["target"]].copy()
-result["probability"] = probability
-
 print(
-    result.sort_values(
-        "probability",
-        ascending=False
-    )
+    model.feature_usefulness().head(20)
 )
 
 
-# Save model locally AND upload everything to R2
+print("\nThreshold statistics:")
+print(
+    model.threshold_stats()
+)
+
+
 model.save()
+
 
 model.upload_all(
     bucket="stocks-data",
     cloud_folder="jasip4/xgboost"
 )
+
 
 print("\nFull process complete")
