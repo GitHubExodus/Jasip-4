@@ -155,14 +155,14 @@ class StockLibrary:
             Bucket=self.bucket
         ).get("Contents", [])
 
-        # stocks = [
-        #     obj["Key"][:-8]
-        #     for obj in objects
-        #     if "/" not in obj["Key"]
-        #     and obj["Key"].endswith(".parquet")
-        # ]
+        stocks = [
+            obj["Key"][:-8]
+            for obj in objects
+            if "/" not in obj["Key"]
+            and obj["Key"].endswith(".parquet")
+        ]
 
-        stocks = ["AAPL"]
+        # stocks = ["AAPL"]
 
         train_parts = []
         validation_parts = []
