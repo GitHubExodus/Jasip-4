@@ -21,9 +21,9 @@ class SplitRanking:
 
         self.s3 = boto3.client(
             "s3",
-            endpoint_url=os.environ["R2_ENDPOINT"],
-            aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-            aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"]
+            endpoint_url="https://98f8e959e677f16bddcf44f609fec6a0.r2.cloudflarestorage.com",
+            aws_access_key_id="f47f48ce0d129b1a69bb36da1d64bad1",
+            aws_secret_access_key="3e92e25062abc6fe86c13455712967444aa1ffa3492d1d81258f7f4ecd5923aa"
         )
 
     def run(self):
