@@ -1,5 +1,5 @@
 from main import StockLibrary
-from xgboostClass import XGBoostLibrary
+from splitRanking import SplitRanking
 
 
 stock_data = StockLibrary(
@@ -20,6 +20,7 @@ print("Testing:", testing.shape)
 print("Profits:", profits.shape)
 
 
+# Save all processed data locally and to R2
 for file in [
     "training.parquet",
     "validation.parquet",
@@ -34,46 +35,21 @@ for file in [
 print("Processed data saved to R2")
 
 
-model = XGBoostLibrary(
-    train_file="data/training.parquet",
-    validation_file="data/validation.parquet",
-    test_file="data/testing.parquet",
-    stats_dir="data/xgboost"
-)
+# Use profit directly as the target
+train["target"] = profits.reindex(train.index)
 
 
-model.train_model(
-    n_estimators=1000,
-    max_depth=14,
-    learning_rate=0.05,
-    subsample=0.8,
-    colsample_bytree=0.8
-)
-
-
-print("\nModel statistics:")
-print(model.evaluate())
-
-
-print("\nFeature usefulness:")
-print(
-    model.feature_usefulness().head(20)
-)
-
-
-print("\nThreshold statistics:")
-print(
-    model.threshold_stats()
-)
-
-
-model.save()
-
-
-model.upload_all(
+ranking = SplitRanking(
+    train,
+    local_dir="data/splits",
     bucket="stocks-data",
-    cloud_folder="jasip4/xgboost"
+    cloud_folder="jasip4/splits"
 )
 
+ranking.run()
+ranking.save()
 
-print("\nFull process complete")
+print("\nTop splits:")
+print(ranking.ranking.head(30))
+
+print("\nSplit ranking saved locally and to R2")

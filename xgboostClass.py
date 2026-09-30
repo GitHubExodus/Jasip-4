@@ -1,19 +1,21 @@
 import os
 import json
-import boto3
 import xgboost as xgb
-import numpy as np
+import boto3
 import pandas as pd
 
 from sklearn.metrics import (
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    log_loss,
+    confusion_matrix
 )
 
 
 class XGBoostLibrary:
-
     def __init__(
         self,
         train_file="data/training.parquet",
@@ -26,32 +28,23 @@ class XGBoostLibrary:
         self.test = pd.read_parquet(test_file)
 
         self.stats_dir = stats_dir
-
         os.makedirs(stats_dir, exist_ok=True)
 
         self.model = None
         self.params = {}
 
-    def _x(self, data):
-        return data.drop(
-            columns=["target", "stock"],
-            errors="ignore"
-        )
-
     def train_model(self, **params):
-
         self.params = params
 
-        x_train = self._x(self.train)
+        x_train = self.train.drop(columns=["target", "stock"], errors="ignore")
         y_train = self.train["target"]
 
-        x_val = self._x(self.validation)
+        x_val = self.validation.drop(columns=["target", "stock"], errors="ignore")
         y_val = self.validation["target"]
 
         self.model = xgb.XGBRegressor(
             **params,
-            objective="reg:squarederror",
-            eval_metric="rmse"
+            eval_metric="logloss"
         )
 
         self.model.fit(
@@ -66,46 +59,28 @@ class XGBoostLibrary:
         return self.model
 
     def _save_stats(self):
-
-        x_test = self._x(self.test)
+        x_test = self.test.drop(columns=["target", "stock"], errors="ignore")
         y_test = self.test["target"]
 
         predictions = self.model.predict(x_test)
+        probabilities = self.model.predict_proba(x_test)[:, 1]
+
+        tn, fp, fn, tp = confusion_matrix(
+            y_test,
+            predictions
+        ).ravel()
 
         stats = pd.DataFrame([{
-            "mae": mean_absolute_error(
-                y_test,
-                predictions
-            ),
-
-            "mse": mean_squared_error(
-                y_test,
-                predictions
-            ),
-
-            "rmse": np.sqrt(
-                mean_squared_error(
-                    y_test,
-                    predictions
-                )
-            ),
-
-            "r2": r2_score(
-                y_test,
-                predictions
-            ),
-
-            "actual_average_profit":
-                y_test.mean(),
-
-            "predicted_average_profit":
-                predictions.mean(),
-
-            "actual_total_profit":
-                y_test.sum(),
-
-            "predicted_total_profit":
-                predictions.sum()
+            "accuracy": accuracy_score(y_test, predictions),
+            "precision": precision_score(y_test, predictions, zero_division=0),
+            "recall": recall_score(y_test, predictions, zero_division=0),
+            "f1": f1_score(y_test, predictions, zero_division=0),
+            "roc_auc": roc_auc_score(y_test, probabilities),
+            "log_loss": log_loss(y_test, probabilities),
+            "true_negative": tn,
+            "false_positive": fp,
+            "false_negative": fn,
+            "true_positive": tp
         }])
 
         stats.to_parquet(
@@ -113,49 +88,32 @@ class XGBoostLibrary:
             index=False
         )
 
-        booster = self.model.get_booster()
-
-        gain = booster.get_score(
-            importance_type="gain"
-        )
-
-        weight = booster.get_score(
-            importance_type="weight"
-        )
-
-        cover = booster.get_score(
-            importance_type="cover"
-        )
-
         importance = pd.DataFrame({
             "feature": x_test.columns,
-
             "gain": [
-                gain.get(f, 0)
+                self.model.get_booster().get_score(
+                    importance_type="gain"
+                ).get(f, 0)
                 for f in x_test.columns
             ],
-
             "weight": [
-                weight.get(f, 0)
+                self.model.get_booster().get_score(
+                    importance_type="weight"
+                ).get(f, 0)
                 for f in x_test.columns
             ],
-
             "cover": [
-                cover.get(f, 0)
+                self.model.get_booster().get_score(
+                    importance_type="cover"
+                ).get(f, 0)
                 for f in x_test.columns
             ]
         })
 
-        total_gain = importance["gain"].sum()
-
-        if total_gain > 0:
-            importance["gain_percent"] = (
-                importance["gain"]
-                / total_gain
-                * 100
-            )
-        else:
-            importance["gain_percent"] = 0
+        importance["gain_percent"] = (
+            importance["gain"] /
+            importance["gain"].sum() * 100
+        )
 
         importance = importance.sort_values(
             "gain",
@@ -171,87 +129,31 @@ class XGBoostLibrary:
             f"{self.stats_dir}/model_params.json",
             "w"
         ) as f:
-            json.dump(
-                self.params,
-                f,
-                indent=4
-            )
+            json.dump(self.params, f, indent=4)
 
     def predict(self, data=None):
-
         if data is None:
             data = self.test
 
-        return self.model.predict(
-            self._x(data)
+        x = data.drop(
+            columns=["target", "stock"],
+            errors="ignore"
         )
 
-    def predict_profit(self, data=None):
+        return self.model.predict(x)
 
-        return self.predict(data)
+    def predict_probability(self, data=None):
+        if data is None:
+            data = self.test
 
-    def threshold_stats(self):
-
-        predictions = self.predict(self.test)
-        actual = self.test["target"].to_numpy()
-
-        thresholds = [
-            -2.0,
-            -1.0,
-            0.0,
-            0.25,
-            0.5,
-            0.75,
-            1.0,
-            1.5,
-            2.0,
-            3.0,
-            5.0
-        ]
-
-        rows = []
-
-        for threshold in thresholds:
-
-            selected = predictions >= threshold
-
-            count = selected.sum()
-
-            if count > 0:
-                profits = actual[selected]
-
-                rows.append({
-                    "threshold": threshold,
-                    "trades": count,
-                    "total_profit": profits.sum(),
-                    "average_profit": profits.mean(),
-                    "median_profit": np.median(profits),
-                    "win_rate": (
-                        (profits > 0).mean() * 100
-                    )
-                })
-
-            else:
-                rows.append({
-                    "threshold": threshold,
-                    "trades": 0,
-                    "total_profit": 0,
-                    "average_profit": 0,
-                    "median_profit": 0,
-                    "win_rate": 0
-                })
-
-        result = pd.DataFrame(rows)
-
-        result.to_parquet(
-            f"{self.stats_dir}/threshold_stats.parquet",
-            index=False
+        x = data.drop(
+            columns=["target", "stock"],
+            errors="ignore"
         )
 
-        return result
+        return self.model.predict_proba(x)[:, 1]
 
     def evaluate(self):
-
         stats = pd.read_parquet(
             f"{self.stats_dir}/model_stats.parquet"
         )
@@ -259,69 +161,42 @@ class XGBoostLibrary:
         return stats.iloc[0].to_dict()
 
     def feature_usefulness(self):
-
         return pd.read_parquet(
             f"{self.stats_dir}/feature_stats.parquet"
         )
 
-    def save(
-        self,
-        file="data/xgboost/xgboost_model.json"
-    ):
-
+    def save(self, file="data/xgboost/xgboost_model.json"):
         self.model.save_model(file)
 
-    def load(
-        self,
-        file="data/xgboost/xgboost_model.json"
-    ):
-
+    def load(self, file="data/xgboost/xgboost_model.json"):
         self.model = xgb.XGBRegressor()
-
         self.model.load_model(file)
-
         return self.model
 
-    def upload_all(
-        self,
-        bucket,
-        cloud_folder
-    ):
 
+    def upload_all(self, bucket, cloud_folder):
         s3 = boto3.client(
             "s3",
-            endpoint_url=os.environ["R2_ENDPOINT"],
-            aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-            aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"]
+            endpoint_url="https://98f8e959e677f16bddcf44f609fec6a0.r2.cloudflarestorage.com",
+            aws_access_key_id="f47f48ce0d129b1a69bb36da1d64bad1",
+            aws_secret_access_key="3e92e25062abc6fe86c13455712967444aa1ffa3492d1d81258f7f4ecd5923aa"
         )
 
         files = [
             "xgboost_model.json",
             "model_stats.parquet",
             "feature_stats.parquet",
-            "model_params.json",
-            "threshold_stats.parquet"
+            "model_params.json"
         ]
 
         for file in files:
+            local_file = (
+                self.stats_dir + "/" + file
+                if file != "xgboost_model.json"
+                else "data/xgboost/" + file
+            )
 
-            if file == "xgboost_model.json":
-                local_file = (
-                    "data/xgboost/"
-                    + file
-                )
-            else:
-                local_file = (
-                    self.stats_dir
-                    + "/"
-                    + file
-                )
-
-            with open(
-                local_file,
-                "rb"
-            ) as f:
-
+            with open(local_file, "rb") as f:
                 s3.put_object(
                     Bucket=bucket,
                     Key=f"{cloud_folder}/{file}",
